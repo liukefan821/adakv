@@ -38,7 +38,11 @@ class AdaKVCache:
         nb = (S + self.block_size - 1) // self.block_size
         pad = nb * self.block_size - S
         kk = torch.nn.functional.pad(k, (0, 0, 0, pad)) if pad else k
-        self.centroid = kk.view(Hkv, nb, self.block_size, D).mean(dim=2)
+        # mean over *real* tokens per block (last block may be partial)
+        counts = torch.full((nb,), self.block_size, device=k.device, dtype=kk.dtype)
+        if pad:
+            counts[-1] = self.block_size - pad
+        self.centroid = kk.view(Hkv, nb, self.block_size, D).sum(dim=2) / counts.view(1, nb, 1)
         return self
 
     def append_decode(self, k_t, v_t):
