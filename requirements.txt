@@ -1,0 +1,6 @@
+# Core (CPU oracle + tests)
+numpy>=1.24
+# GPU runtime + kernels (install on a CUDA box):
+#   torch>=2.3  triton>=2.3  transformers>=4.44  accelerate>=0.33
+# Benchmarks:
+#   datasets>=2.20  tqdm>=4.66  matplotlib>=3.8

@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.venv/
+# data & artifacts (keep large timeseries / model weights out of git)
+models/
+results/
+*.pt
+*.safetensors
+*.npz
