@@ -20,14 +20,19 @@ def select_blocks(
     k_per_head: np.ndarray,
     n_sink_blocks: int = 1,
     n_local_blocks: int = 4,
+    c_min: int = 1,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return a boolean block mask and the per-head selected count.
 
     Args:
         scores: ``[n_heads, n_blocks]``.
-        k_per_head: ``[n_heads]`` budget (from :func:`adakv.budget.allocate_budget`).
+        k_per_head: ``[n_heads]`` *total* budget (from :func:`adakv.budget.allocate_budget`).
         n_sink_blocks: forced leading blocks.
         n_local_blocks: forced trailing blocks.
+        c_min: minimum number of *content* blocks (beyond sink/local) every head
+            must keep. Guarantees a head is never reduced to stabilisers only
+            (which would silently degrade it to StreamingLLM and drop mid-context
+            facts). The effective floor is ``sink + local + c_min``.
 
     Returns:
         ``mask``: ``[n_heads, n_blocks]`` bool, ``counts``: ``[n_heads]`` int.
@@ -44,9 +49,9 @@ def select_blocks(
 
     order = np.argsort(-biased, axis=1)  # descending
     mask = np.zeros((H, B), dtype=bool)
-    floor = sink + local
+    floor = min(sink + local + c_min, B)
     for h in range(H):
-        kh = max(int(k_per_head[h]), floor)
+        kh = min(max(int(k_per_head[h]), floor), B)
         mask[h, order[h, :kh]] = True
         if sink:
             mask[h, :sink] = True

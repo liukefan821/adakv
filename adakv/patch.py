@@ -28,7 +28,8 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 _ADAKV_CFG = dict(enabled=True, block_size=16, avg_budget=16, k_min=2, k_max=64,
                   n_sink_blocks=1, n_local_blocks=4, temperature=1.0,
-                  estimator="centroid", budget_policy="adaptive")
+                  estimator="centroid", budget_policy="adaptive",
+                  c_min=1, nucleus_p=0.9)
 _SDPA = ALL_ATTENTION_FUNCTIONS["sdpa"]
 
 
@@ -44,7 +45,8 @@ def adakv_attention_forward(module, query, key, value, attention_mask, scaling, 
     cache = AdaKVCache(block_size=cfg["block_size"], estimator=cfg["estimator"]).append_prefill(k, v)
     bt, sl = plan_selection(qh, cache, cfg["avg_budget"], cfg["k_min"], cfg["k_max"],
                             cfg["n_sink_blocks"], cfg["n_local_blocks"], cfg["temperature"],
-                            estimator=cfg["estimator"], budget_policy=cfg["budget_policy"])
+                            estimator=cfg["estimator"], budget_policy=cfg["budget_policy"],
+                            c_min=cfg["c_min"], nucleus_p=cfg["nucleus_p"])
     if HAS_TRITON and qh.is_cuda:
         out = block_sparse_decode(qh, k, v, bt, sl, cfg["block_size"], sm_scale=scaling)
     else:

@@ -52,6 +52,9 @@ def sparse_attention(
     estimator: str = "centroid",
     n_sink_blocks: int = 1,
     n_local_blocks: int = 4,
+    c_min: int = 1,
+    budget_policy: str = "adaptive",
+    nucleus_p: float = 0.9,
     return_mask: bool = False,
 ):
     """AdaKV decode-step attention oracle.
@@ -65,8 +68,9 @@ def sparse_attention(
     scores = block_scores(q, summ)               # [H, n_blocks]
     n_blocks = summ["n_blocks"]
 
-    k = allocate_budget(scores, avg_budget, min(k_min, n_blocks), min(k_max, n_blocks))
-    mask, counts = select_blocks(scores, k, n_sink_blocks, n_local_blocks)
+    k = allocate_budget(scores, avg_budget, min(k_min, n_blocks), min(k_max, n_blocks),
+                        policy=budget_policy, nucleus_p=nucleus_p)
+    mask, counts = select_blocks(scores, k, n_sink_blocks, n_local_blocks, c_min)
 
     tok = np.repeat(mask, block_size, axis=1)[:, :S]  # block mask -> token mask
     a = np.einsum("hd,hsd->hs", q, K) / np.sqrt(D)
