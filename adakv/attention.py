@@ -91,11 +91,11 @@ def plan_selection(
         biased[:, nb - local :] = float("inf")
     order = biased.argsort(dim=-1, descending=True)                # [Hq, nb] permutation
 
-    max_sel = int(kph.clamp_min(sink + local).max().item())
+    max_sel = min(int(kph.clamp_min(sink + local).max().item()), nb)
     block_table = torch.zeros(Hq, max_sel, dtype=torch.int32, device=q.device)
     sel_lens = torch.zeros(Hq, dtype=torch.int32, device=q.device)
     for h in range(Hq):
-        kh = max(int(kph[h]), sink + local)
+        kh = min(max(int(kph[h]), sink + local), nb)
         block_table[h, :kh] = order[h, :kh].to(torch.int32)
         sel_lens[h] = kh
     # NOTE: this host loop is the obvious next thing to vectorise / fuse.
