@@ -21,6 +21,30 @@ import torch
 from .kernels.block_sparse_decode import block_sparse_decode
 
 
+# --- optional realized-budget instrumentation -------------------------------
+# When tracing is on, every plan_selection call appends its mean blocks/head.
+# Used by benchmarks to prove that two methods ran at an equal *realized* KV
+# budget on the actual model trace (not just an equal target).
+_BUDGET_TRACE = None
+
+
+def reset_budget_trace():
+    """Start (or restart) recording realized mean blocks/head per decode step."""
+    global _BUDGET_TRACE
+    _BUDGET_TRACE = []
+
+
+def get_budget_trace():
+    """Return the list of per-step mean blocks/head recorded since reset."""
+    return list(_BUDGET_TRACE) if _BUDGET_TRACE is not None else []
+
+
+def stop_budget_trace():
+    """Disable recording (zero overhead in plan_selection)."""
+    global _BUDGET_TRACE
+    _BUDGET_TRACE = None
+
+
 class AdaKVCache:
     """Full KV cache plus precomputed block summaries (no permanent eviction)."""
 
@@ -30,6 +54,9 @@ class AdaKVCache:
         self.k = None  # [n_kv_heads, S, D]
         self.v = None
         self.centroid = None  # [n_kv_heads, n_blocks, D]
+        # Quest-style per-dimension block bounds; built only when estimator=="minmax".
+        self.kmin = None  # [n_kv_heads, n_blocks, D]
+        self.kmax = None  # [n_kv_heads, n_blocks, D]
 
     def append_prefill(self, k, v):
         """Store prefill KV and (re)compute block centroids. k,v: [Hkv,S,D]."""
@@ -43,6 +70,14 @@ class AdaKVCache:
         if pad:
             counts[-1] = self.block_size - pad
         self.centroid = kk.view(Hkv, nb, self.block_size, D).sum(dim=2) / counts.view(1, nb, 1)
+        # Quest baseline estimator: per-block per-dim min/max over *real* tokens.
+        # Pad with +inf for the min reduction and -inf for the max reduction so the
+        # partial trailing block's padding never enters the statistic.
+        if self.estimator == "minmax":
+            kmax_pad = torch.nn.functional.pad(k, (0, 0, 0, pad), value=float("-inf")) if pad else k
+            kmin_pad = torch.nn.functional.pad(k, (0, 0, 0, pad), value=float("inf")) if pad else k
+            self.kmax = kmax_pad.view(Hkv, nb, self.block_size, D).amax(dim=2)
+            self.kmin = kmin_pad.view(Hkv, nb, self.block_size, D).amin(dim=2)
         return self
 
     def append_decode(self, k_t, v_t):
@@ -62,8 +97,20 @@ def plan_selection(
     n_sink_blocks: int = 1,
     n_local_blocks: int = 4,
     temperature: float = 1.0,
+    estimator: str = "centroid",
+    budget_policy: str = "adaptive",
 ):
-    """Score blocks, allocate an adaptive per-head budget, select blocks.
+    """Score blocks, allocate a per-head budget, select blocks.
+
+    The (estimator, budget_policy) pair selects one cell of the comparison grid:
+      - ("centroid", "adaptive")  -> AdaKV (ours)
+      - ("minmax",   "fixed")     -> Quest baseline (in-framework, same kernel)
+      - ("centroid", "fixed")     -> estimator-only ablation
+      - ("minmax",   "adaptive")  -> budget-only ablation
+
+    Only the scoring and the per-head count differ across cells; sink/local
+    stabilisers, the gather, and the kernel are identical, so an equal-budget
+    quality comparison isolates exactly the two algorithmic contributions.
 
     Returns (block_table [int32, Hq x max_sel], sel_lens [int32, Hq]) ready for
     the kernel. sel_lens >= n_sink_blocks + n_local_blocks >= 1.
@@ -72,24 +119,47 @@ def plan_selection(
     Hkv, nb, _ = cache.centroid.shape
     group = Hq // Hkv
 
-    cent = cache.centroid.repeat_interleave(group, dim=0)          # [Hq, nb, D]
-    scores = torch.einsum("hd,hbd->hb", q.float(), cent.float())   # [Hq, nb]
+    # --- block scores -------------------------------------------------------
+    if estimator == "centroid":
+        cent = cache.centroid.repeat_interleave(group, dim=0)          # [Hq, nb, D]
+        scores = torch.einsum("hd,hbd->hb", q.float(), cent.float())   # [Hq, nb]
+    elif estimator == "minmax":
+        if cache.kmin is None or cache.kmax is None:
+            raise ValueError("minmax estimator needs AdaKVCache(estimator='minmax')")
+        kmn = cache.kmin.repeat_interleave(group, dim=0).float()       # [Hq, nb, D]
+        kmx = cache.kmax.repeat_interleave(group, dim=0).float()
+        qf = q.float()
+        qpos = qf.clamp_min(0.0)[:, None, :]
+        qneg = qf.clamp_max(0.0)[:, None, :]
+        scores = (qpos * kmx + qneg * kmn).sum(-1)                     # Quest upper bound
+    else:
+        raise ValueError(f"unknown estimator: {estimator!r}")
 
-    # adaptive budget from block-score concentration (normalised entropy)
-    p = torch.softmax(scores / max(temperature, 1e-6), dim=-1)
-    ent = -(p * p.clamp_min(1e-9).log()).sum(-1) / math.log(max(nb, 2))
-    raw = k_min + ent * (min(k_max, nb) - k_min)
-    raw = raw * (avg_budget / raw.mean().clamp_min(1e-6))
-    kph = raw.round().clamp(k_min, min(k_max, nb)).long()          # [Hq]
+    kmax_eff = min(k_max, nb)
 
-    # force sink + local, fill remaining budget with top-scoring blocks
+    # --- per-head budget ----------------------------------------------------
+    if budget_policy == "adaptive":
+        # adaptive budget from block-score concentration (normalised entropy)
+        p = torch.softmax(scores / max(temperature, 1e-6), dim=-1)
+        ent = -(p * p.clamp_min(1e-9).log()).sum(-1) / math.log(max(nb, 2))
+        raw = k_min + ent * (kmax_eff - k_min)
+        raw = raw * (avg_budget / raw.mean().clamp_min(1e-6))
+        kph = raw.round().clamp(k_min, kmax_eff).long()                # [Hq]
+    elif budget_policy == "fixed":
+        # Quest: identical top-k for every head/layer.
+        kfix = int(min(max(int(avg_budget), k_min), kmax_eff))
+        kph = torch.full((Hq,), kfix, dtype=torch.long, device=q.device)
+    else:
+        raise ValueError(f"unknown budget_policy: {budget_policy!r}")
+
+    # --- force sink + local, fill remaining budget with top-scoring blocks ---
     sink, local = min(n_sink_blocks, nb), min(n_local_blocks, nb)
     biased = scores.clone()
     if sink:
         biased[:, :sink] = float("inf")
     if local:
         biased[:, nb - local :] = float("inf")
-    order = biased.argsort(dim=-1, descending=True)                # [Hq, nb] permutation
+    order = biased.argsort(dim=-1, descending=True)                    # [Hq, nb] permutation
 
     max_sel = min(int(kph.clamp_min(sink + local).max().item()), nb)
     block_table = torch.zeros(Hq, max_sel, dtype=torch.int32, device=q.device)
@@ -99,6 +169,9 @@ def plan_selection(
         block_table[h, :kh] = order[h, :kh].to(torch.int32)
         sel_lens[h] = kh
     # NOTE: this host loop is the obvious next thing to vectorise / fuse.
+
+    if _BUDGET_TRACE is not None:
+        _BUDGET_TRACE.append(float(sel_lens.float().mean().item()))
     return block_table, sel_lens
 
 
