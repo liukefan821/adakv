@@ -69,7 +69,8 @@ def sparse_attention(
     n_blocks = summ["n_blocks"]
 
     k = allocate_budget(scores, avg_budget, min(k_min, n_blocks), min(k_max, n_blocks),
-                        policy=budget_policy, nucleus_p=nucleus_p)
+                        policy=budget_policy, nucleus_p=nucleus_p,
+                        floor=min(n_sink_blocks, n_blocks) + min(n_local_blocks, n_blocks) + c_min)
     mask, counts = select_blocks(scores, k, n_sink_blocks, n_local_blocks, c_min)
 
     tok = np.repeat(mask, block_size, axis=1)[:, :S]  # block mask -> token mask

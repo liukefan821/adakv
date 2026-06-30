@@ -185,31 +185,32 @@ def plan_selection(
         raise ValueError(f"unknown estimator: {estimator!r}")
 
     kmax_eff = min(k_max, nb)
+    sink, local = min(n_sink_blocks, nb), min(n_local_blocks, nb)
+    floor = min(sink + local + c_min, nb)
+    lo = min(max(floor, k_min, 1), nb)
 
     # --- per-head budget (mean pinned to avg_budget for every policy) --------
+    # Every head is guaranteed `lo` blocks; the surplus (avg_budget-lo)*Hq is
+    # distributed by a per-head weight, so the realized mean equals avg_budget
+    # exactly (no one-sided floor clamp -> no budget overspend).
+    target = float(min(max(avg_budget, lo), kmax_eff))
     if budget_policy == "fixed":
-        # Quest: identical top-k for every head/layer.
-        kfix = int(min(max(int(avg_budget), k_min), kmax_eff))
-        kph = torch.full((Hq,), kfix, dtype=torch.long, device=q.device)
+        kph = torch.full((Hq,), int(round(target)), dtype=torch.long, device=q.device)
     elif budget_policy in ("adaptive", "adaptive_nucleus"):
         p = torch.softmax(scores / max(temperature, 1e-6), dim=-1)
         if budget_policy == "adaptive":
-            # entropy of the block-score softmax: flat heads get more.
-            ent = -(p * p.clamp_min(1e-9).log()).sum(-1) / math.log(max(nb, 2))
-            raw = k_min + ent * (kmax_eff - k_min)
+            w = -(p * p.clamp_min(1e-9).log()).sum(-1) / math.log(max(nb, 2))   # entropy
+            w = w + 1e-6
         else:
-            # nucleus: #blocks to capture nucleus_p of the attention mass.
             ps, _ = torch.sort(p, dim=-1, descending=True)
-            cum = ps.cumsum(dim=-1)
-            raw = (cum < nucleus_p).sum(dim=-1).float() + 1.0
-        raw = raw * (avg_budget / raw.mean().clamp_min(1e-6))
-        kph = raw.round().clamp(k_min, kmax_eff).long()                # [Hq]
+            w = ((ps.cumsum(dim=-1) < nucleus_p).sum(dim=-1).float() + 1.0)      # nucleus
+        surplus_total = max(target - lo, 0.0) * Hq
+        extra = surplus_total * w / w.sum().clamp_min(1e-9)
+        kph = (lo + extra).round().clamp(lo, kmax_eff).long()
     else:
         raise ValueError(f"unknown budget_policy: {budget_policy!r}")
 
     # --- force sink + local, fill remaining budget with top-scoring blocks ---
-    sink, local = min(n_sink_blocks, nb), min(n_local_blocks, nb)
-    floor = min(sink + local + c_min, nb)
     biased = scores.clone()
     if sink:
         biased[:, :sink] = float("inf")
