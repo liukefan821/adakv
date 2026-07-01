@@ -218,14 +218,15 @@ def plan_selection(
         biased[:, nb - local :] = float("inf")
     order = biased.argsort(dim=-1, descending=True)                    # [Hq, nb] permutation
 
-    max_sel = min(int(kph.clamp_min(floor).max().item()), nb)
-    block_table = torch.zeros(Hq, max_sel, dtype=torch.int32, device=q.device)
-    sel_lens = torch.zeros(Hq, dtype=torch.int32, device=q.device)
-    for h in range(Hq):
-        kh = min(max(int(kph[h]), floor), nb)
-        block_table[h, :kh] = order[h, :kh].to(torch.int32)
-        sel_lens[h] = kh
-    # NOTE: this host loop is the obvious next thing to vectorise / fuse.
+    # --- vectorised selection: take the top kph[h] of `order` per head --------
+    # `order` already has sink+local first (forced via +inf), so order[h,:kph[h]]
+    # contains the stabilisers plus the highest-scoring content blocks. The kernel
+    # reads only the first sel_lens[h] entries of each row, so the trailing columns
+    # (for heads with kph[h] < max_sel) are simply ignored -- no host loop needed.
+    kph = kph.clamp(min=lo, max=nb)
+    max_sel = int(kph.max().item())
+    block_table = order[:, :max_sel].to(torch.int32).contiguous()
+    sel_lens = kph.to(torch.int32)
 
     if _BUDGET_TRACE is not None:
         _BUDGET_TRACE.append(float(sel_lens.float().mean().item()))
