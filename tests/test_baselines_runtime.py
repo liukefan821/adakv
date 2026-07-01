@@ -16,6 +16,10 @@ import torch
 
 from adakv import baselines as B          # NumPy oracle
 from adakv import baselines_rt as RT      # torch runtime
+from adakv.attention import (
+    record_selection, reset_budget_trace, get_budget_trace, stop_budget_trace,
+    set_recall_target, get_recall, clear_recall_target,
+)
 
 BS = 16
 H, S, D = 6, 384, 64
@@ -107,6 +111,46 @@ def test_gqa_expand():
     assert xe.shape == (Hkv * group, S, D)
     for g in range(group):
         assert torch.equal(xe[g], x[0]) and torch.equal(xe[group + g], x[1])
+
+
+def test_frozen_decode_block_table():
+    """Decode-time reconstruction: content selection frozen, recent window tracks
+    the growing tail, per-head counts stay equal."""
+    _, _, Qt, Kt = _qk(5)
+    fmask = RT.h2o_retained_mask_torch(Qt, Kt, block_size=BS, budget=8,
+                                       n_sink_blocks=SINK, n_local_blocks=LOCAL, c_min=CMIN)
+    Hf, nbp = fmask.shape
+    k = int(fmask.sum(1)[0])
+
+    # no growth -> exactly the frozen set (sink/local were already forced)
+    bt0, sl0 = RT.frozen_decode_block_table(fmask, nbp, SINK, LOCAL)
+    dm0 = torch.zeros(Hf, nbp, dtype=torch.bool)
+    dm0.scatter_(1, bt0.long(), True)
+    assert torch.equal(dm0, fmask) and bool((sl0 == k).all())
+
+    # grow by 3 blocks
+    grow, nb_now = 3, nbp + 3
+    bt, sl = RT.frozen_decode_block_table(fmask, nb_now, SINK, LOCAL)
+    dm = torch.zeros(Hf, nb_now, dtype=torch.bool)
+    dm.scatter_(1, bt.long(), True)
+    assert torch.equal(dm[:, SINK : nbp - LOCAL], fmask[:, SINK : nbp - LOCAL]), \
+        "evicted content must stay evicted (frozen)"
+    assert bool(dm[:, nb_now - LOCAL :].all()), "current local window must be attended"
+    assert bool((sl == k + min(LOCAL, grow)).all()), f"counts drifted: {sl.tolist()}"
+
+
+def test_record_selection_hooks():
+    """record_selection drives the same budget-trace + recall instruments the
+    harness reads, so the frozen path reports metrics like plan_selection."""
+    reset_budget_trace()
+    set_recall_target([2, 5])
+    bt = torch.tensor([[2, 4, 7], [0, 5, 9]], dtype=torch.int32)   # H=2, 3 blocks each
+    sl = torch.tensor([3, 3], dtype=torch.int32)
+    record_selection(bt, sl, nb=10)
+    tr = get_budget_trace(); stop_budget_trace()
+    r = get_recall(); clear_recall_target()
+    assert len(tr) == 1 and abs(tr[0] - 3.0) < 1e-6, f"budget trace {tr}"
+    assert abs(r - 1.0) < 1e-6, f"both targets covered -> recall 1.0, got {r}"
 
 
 if __name__ == "__main__":

@@ -88,6 +88,21 @@ def _record_recall(block_table, sel_lens, nb):
             _RECALL_HITS += int(bool(sel[b].item()))
 
 
+def record_selection(block_table, sel_lens, nb):
+    """Record realized budget + needle coverage for one decode step's selection.
+
+    Appends the mean blocks/head to the budget trace and tallies target-block
+    coverage, if either instrument is active. Factored out of ``plan_selection``
+    so the frozen H2O/SnapKV decode path (``patch.py``) reports the *same*
+    ``realized`` and ``recall`` metrics through the same harness, keeping the
+    equal-budget comparison auditable across all methods.
+    """
+    if _BUDGET_TRACE is not None:
+        _BUDGET_TRACE.append(float(sel_lens.float().mean().item()))
+    if _RECALL_TARGET is not None:
+        _record_recall(block_table, sel_lens, nb)
+
+
 class AdaKVCache:
     """Full KV cache plus precomputed block summaries (no permanent eviction)."""
 
@@ -228,10 +243,7 @@ def plan_selection(
     block_table = order[:, :max_sel].to(torch.int32).contiguous()
     sel_lens = kph.to(torch.int32)
 
-    if _BUDGET_TRACE is not None:
-        _BUDGET_TRACE.append(float(sel_lens.float().mean().item()))
-    if _RECALL_TARGET is not None:
-        _record_recall(block_table, sel_lens, nb)
+    record_selection(block_table, sel_lens, nb)
     return block_table, sel_lens
 
 

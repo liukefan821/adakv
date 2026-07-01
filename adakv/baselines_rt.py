@@ -31,6 +31,7 @@ __all__ = [
     "h2o_retained_mask_torch",
     "snapkv_retained_mask_torch",
     "mask_to_block_table",
+    "frozen_decode_block_table",
 ]
 
 
@@ -171,3 +172,34 @@ def mask_to_block_table(mask: torch.Tensor):
     assert bool((counts == k).all()), "mask_to_block_table expects an equal count per head"
     block_table = mask.nonzero(as_tuple=False)[:, 1].view(H, k).to(torch.int32).contiguous()
     return block_table, counts.to(torch.int32)
+
+
+@torch.no_grad()
+def frozen_decode_block_table(
+    fmask: torch.Tensor, nb_now: int, n_sink_blocks: int, n_local_blocks: int
+):
+    """Decode-step ``(block_table, sel_lens)`` from the frozen prefill mask.
+
+    ``fmask : [H, nb_prefill]`` bool -- the retained set fixed at prefill. As
+    decode extends the sequence to ``nb_now >= nb_prefill`` blocks, the frozen
+    CONTENT selection never changes (that is the eviction), and only the sink +
+    local (recent) stabilisers track the current tail. So newly generated blocks
+    are attended while evicted content stays evicted -- the query-agnostic,
+    lossy behaviour H2O/SnapKV are meant to model.
+
+    Per-head counts stay equal (the current local window can only reach back into
+    the prefill-local blocks, which were already retained), so the result is
+    kernel-ready. Realized budget = frozen budget + new trailing blocks, usually
+    +0..2 over a short answer; the budget trace records it honestly.
+    """
+    H, nbp = fmask.shape
+    assert nb_now >= nbp, "decode block count must not shrink below prefill"
+    sink = min(n_sink_blocks, nb_now)
+    local = min(n_local_blocks, nb_now)
+    dmask = torch.zeros(H, nb_now, dtype=torch.bool, device=fmask.device)
+    dmask[:, :nbp] = fmask
+    if sink:
+        dmask[:, :sink] = True
+    if local:
+        dmask[:, nb_now - local :] = True
+    return mask_to_block_table(dmask)
