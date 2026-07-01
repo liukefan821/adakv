@@ -106,7 +106,8 @@ def main():
     ap.add_argument("--c-min", type=int, default=1)
     ap.add_argument("--nucleus-p", type=float, default=0.9)
     ap.add_argument("--k-max", type=int, default=100000)
-    ap.add_argument("--methods", nargs="+", default=["dense", "streaming", "quest", "adakv"])
+    ap.add_argument("--methods", nargs="+",
+                    default=["dense", "streaming", "quest", "adakv_cf", "adakv"])
     ap.add_argument("--warmup", type=int, default=10)
     ap.add_argument("--iters", type=int, default=50)
     ap.add_argument("--seed", type=int, default=0)
@@ -153,16 +154,24 @@ def main():
                                     budget_policy="adaptive_nucleus", **common)
             return sparse_attn(q, cache_c, bt, sl)
 
+        def run_adakv_cf():
+            # centroid estimator + FIXED budget: isolates the estimator's speed /
+            # memory advantage over Quest (minmax+fixed) with no adaptive overhead.
+            bt, sl = plan_selection(q, cache_c, B, estimator="centroid",
+                                    budget_policy="fixed", **common)
+            return sparse_attn(q, cache_c, bt, sl)
+
         runners = {"dense": run_dense, "streaming": run_streaming,
-                   "quest": run_quest, "adakv": run_adakv}
+                   "quest": run_quest, "adakv_cf": run_adakv_cf, "adakv": run_adakv}
         summ = {"dense": 0.0, "streaming": summary_mb(cache_c.centroid),
                 "quest": summary_mb(cache_m.kmin) + summary_mb(cache_m.kmax),
+                "adakv_cf": summary_mb(cache_c.centroid),
                 "adakv": summary_mb(cache_c.centroid)}
         # realized blocks/head (dense reads all)
         blk = {"dense": float(nb), "streaming": float(int(sl_s[0]))}
-        for name in ("quest", "adakv"):
+        for name in ("quest", "adakv_cf", "adakv"):
             est = "minmax" if name == "quest" else "centroid"
-            pol = "fixed" if name == "quest" else "adaptive_nucleus"
+            pol = "adaptive_nucleus" if name == "adakv" else "fixed"
             cache = cache_m if name == "quest" else cache_c
             _, sl = plan_selection(q, cache, B, estimator=est, budget_policy=pol, **common)
             blk[name] = float(sl.float().mean().item())
@@ -183,9 +192,12 @@ def main():
             torch.cuda.empty_cache()
 
     print("Read: at long ctx, dense ms/tok grows with L (reads all KV) while "
-          "sparse stays flat (reads ~budget). adakv vs quest at equal budget: same "
-          "attention cost, but centroid scoring is cheaper and its summary is half "
-          "the size (summ_MB column).")
+          "sparse stays flat (reads ~budget). CLEAN estimator comparison: adakv_cf "
+          "(centroid) vs quest (minmax), both fixed budget -> same attention cost, but "
+          "centroid scores read half the summary bytes, so adakv_cf should be <= quest "
+          "at every ctx and its summary is half the size (summ_MB). adakv adds the "
+          "nucleus budget (a quality knob) on top at some scoring overhead. streaming is "
+          "the fast-but-not-query-aware floor (no scoring -> poor retrieval).")
 
 
 if __name__ == "__main__":
