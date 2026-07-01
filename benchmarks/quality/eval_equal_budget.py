@@ -55,13 +55,17 @@ from adakv.attention import (
     set_recall_target, get_recall, clear_recall_target,
 )
 
-# (estimator, budget_policy) for each non-dense method.
+# enable_adakv kwargs for each non-dense method. estimator/budget_policy pick the
+# AdaKV grid cell; selection routes to the frozen eviction baselines (h2o/snapkv),
+# for which estimator/budget_policy are unused (fixed budget, frozen retention).
 METHODS = {
-    "adakv":     ("centroid", "adaptive"),
-    "adakv_nuc": ("centroid", "adaptive_nucleus"),
-    "quest":     ("minmax",   "fixed"),
-    "est_only":  ("centroid", "fixed"),
-    "bud_only":  ("minmax",   "adaptive"),
+    "adakv":     dict(estimator="centroid", budget_policy="adaptive",         selection="adakv"),
+    "adakv_nuc": dict(estimator="centroid", budget_policy="adaptive_nucleus", selection="adakv"),
+    "quest":     dict(estimator="minmax",   budget_policy="fixed",            selection="adakv"),
+    "est_only":  dict(estimator="centroid", budget_policy="fixed",            selection="adakv"),
+    "bud_only":  dict(estimator="minmax",   budget_policy="adaptive",         selection="adakv"),
+    "h2o":       dict(estimator="centroid", budget_policy="fixed",            selection="h2o"),
+    "snapkv":    dict(estimator="centroid", budget_policy="fixed",            selection="snapkv"),
 }
 
 CITIES = ["Lisbon", "Nairobi", "Sapporo", "Calgary", "Brisbane",
@@ -161,9 +165,7 @@ def eval_method(model, tok, data, method, budget, common, block_size, max_new_to
     """Return (accuracy, realized_mean_blocks, mean_recall, ctx_len)."""
     is_sparse = method != "full"
     if is_sparse:
-        est, pol = METHODS[method]
-        enable_adakv(avg_budget=budget, estimator=est, budget_policy=pol,
-                     block_size=block_size, **common)
+        enable_adakv(avg_budget=budget, block_size=block_size, **common, **METHODS[method])
         reset_budget_trace()
     else:
         disable_adakv()
@@ -200,7 +202,7 @@ def main():
     ap.add_argument("--trials", type=int, default=4)
     ap.add_argument("--budgets", type=int, nargs="+", default=[4, 6, 8, 12])
     ap.add_argument("--methods", nargs="+",
-                    default=["full", "quest", "adakv", "adakv_nuc", "est_only", "bud_only"])
+                    default=["full", "quest", "adakv", "adakv_nuc", "h2o", "snapkv", "est_only", "bud_only"])
     ap.add_argument("--block-size", type=int, default=16)
     ap.add_argument("--k-min", type=int, default=1)
     ap.add_argument("--k-max", type=int, default=512)
